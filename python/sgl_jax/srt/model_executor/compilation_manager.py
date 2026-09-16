@@ -254,8 +254,20 @@ class CompilationManager:
             for tokens in self.token_buckets:
                 yield self.max_padded_batch_size, tokens, self.cache_loc_buckets[-1]
         elif mode.is_decode():
+            from sgl_jax.srt.managers.schedule_batch import _decode_kv_ladder_steps
+
+            # Each bs bucket compiles at its max-capacity cache_loc padding, plus
+            # one shape per enabled decode KV ladder step (opt-in via
+            # SGLANG_JAX_DECODE_KV_LADDER, see _decode_kv_ladder_steps in
+            # schedule_batch.py): cache_loc length is part of the jit cache key,
+            # so the ladder shapes must be part of the precompile set.
+            ladder_steps = _decode_kv_ladder_steps(self.page_size)
             for bs, cache_loc in zip(self.bs_buckets, self.cache_loc_buckets):
                 yield bs, bs, cache_loc
+                for step in ladder_steps:
+                    ladder_size = bs * step
+                    if ladder_size < cache_loc:
+                        yield bs, bs, ladder_size
         else:
             raise ValueError(f"No serving precompile shapes for {mode}")
 
@@ -407,16 +419,21 @@ class CompilationManager:
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         start_time = time.perf_counter()
+        from sgl_jax.srt.managers.schedule_batch import _decode_kv_ladder_steps
+
+        decode_shapes = list(self.iter_model_shapes(ForwardMode.DECODE))
         logger.info(
-            "[DECODE] Begin to precompile bs_paddings=%s",
+            "[DECODE] Begin to precompile bs_paddings=%s decode_kv_ladder=%s (%d shapes)",
             self.bs_buckets,
+            _decode_kv_ladder_steps(self.page_size) or "off",
+            len(decode_shapes),
         )
 
         with tqdm(
-            self.iter_model_shapes(ForwardMode.DECODE),
+            decode_shapes,
             desc="[DECODE] PRECOMPILE",
             leave=False,
-            total=len(self.bs_buckets),
+            total=len(decode_shapes),
         ) as pbar:
             for bs_val, num_tokens, aligned_cache_loc_size in pbar:
                 pbar.set_postfix(bs=bs_val)
